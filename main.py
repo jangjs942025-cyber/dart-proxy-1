@@ -4,6 +4,12 @@
 # - op=list      : regular filings list (A) for target selection
 # - op=fnltt_all : fnlttSinglAcntAll paged (cursor/limit) with server-side cache
 #
+# Scope Lock (강제):
+# - op=fnltt_all 은 "III. 재무에 관한 사항" 범위만 데이터 확보 대상으로 인정한다.
+#   - 2. 연결재무제표 5종: BS/IS/CIS/SCE/CF 만 반환(서버 단 필터)
+#   - fs_div는 CFS(연결)로 고정(오염 방지)
+# - 1. 요약재무정보는 별도 표 크롤링이 아니라, 위 5종에서 파생/집계하는 것으로 정의한다(수집기/분석기 레벨에서 처리).
+#
 # ⚠️ 절대 주의:
 # - OPENDART_API_KEY는 GitHub에 올리지 말고 Render "Environment"에만 넣어라.
 # - (선택) PROXY_BEARER_TOKEN을 설정하면 외부 호출을 토큰으로 막는다.
@@ -16,7 +22,7 @@ import xml.etree.ElementTree as ET
 from typing import Dict, Any, Optional, List
 
 import httpx
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Query
 
 
 # ====== ENV ======
@@ -29,7 +35,7 @@ PROXY_BEARER_TOKEN = (os.getenv("PROXY_BEARER_TOKEN") or "").strip()
 
 
 # ====== APP ======
-app = FastAPI(title="DART Proxy (Single Endpoint)", version="1.0.0")
+app = FastAPI(title="DART Proxy (Single Endpoint)", version="1.0.1")
 
 
 # ====== CONSTANTS ======
@@ -42,6 +48,10 @@ HTTP_TIMEOUT = httpx.Timeout(30.0)
 MAX_LIMIT = 500
 MIN_LIMIT = 50
 MAX_CURSOR_PAGES_HINT = 12  # client should stop around this many pages per report
+
+# III. 재무 스코프 락(연결재무제표 5종)
+FS_DIV_LOCK = "CFS"
+SJ_DIV_ALLOWLIST_DEFAULT = {"BS", "IS", "CIS", "SCE", "CF"}
 
 
 # ====== IN-MEMORY CACHES ======
@@ -81,6 +91,22 @@ def _require_token(authorization: Optional[str]) -> None:
     token = authorization.split(" ", 1)[1].strip()
     if token != PROXY_BEARER_TOKEN:
         raise HTTPException(status_code=403, detail="Invalid bearer token")
+
+
+def _parse_sj_div_in(sj_div_in: Optional[str]) -> List[str]:
+    """
+    sj_div_in: "BS,IS,CIS,SCE,CF" 같은 콤마 구분 문자열.
+    - 허용값만 필터.
+    - 유효값이 하나도 없으면 기본 allowlist 적용.
+    """
+    if not sj_div_in:
+        return sorted(list(SJ_DIV_ALLOWLIST_DEFAULT))
+
+    parsed = {x.strip().upper() for x in sj_div_in.split(",") if x.strip()}
+    allow = parsed.intersection(SJ_DIV_ALLOWLIST_DEFAULT)
+    if not allow:
+        allow = SJ_DIV_ALLOWLIST_DEFAULT
+    return sorted(list(allow))
 
 
 async def _get_bytes(path: str, params: Dict[str, str]) -> bytes:
@@ -221,9 +247,13 @@ async def _fnltt_all_page(
     fs_div: str,
     cursor: int,
     limit: int,
+    sj_div_in: Optional[str],
 ) -> Dict[str, Any]:
     resolved = await _resolve_stock_code(stock_code)
     corp_code = resolved["corp_code"]
+
+    # fs_div is locked to CFS (consolidated)
+    fs_div = FS_DIV_LOCK
 
     key = _fs_key(corp_code, bsns_year, reprt_code, fs_div)
     now = _utcnow()
@@ -245,10 +275,14 @@ async def _fnltt_all_page(
         FS_CACHE_TS[key] = now
 
     rows = cached.get("list") or []
-    total_rows = len(rows)
 
+    # ===== III. 재무 스코프 락(연결 5종만) =====
+    allowlist = set(_parse_sj_div_in(sj_div_in))
+    filtered = [r for r in rows if (str(r.get("sj_div") or "").upper() in allowlist)]
+
+    total_rows = len(filtered)
     end = min(cursor + limit, total_rows)
-    page = rows[cursor:end]
+    page = filtered[cursor:end]
     next_cursor = end if end < total_rows else None
 
     return {
@@ -256,6 +290,10 @@ async def _fnltt_all_page(
         "status": str(cached.get("status")),
         "message": str(cached.get("message")),
         "hint": f"Client should avoid >{MAX_CURSOR_PAGES_HINT} pages per report to prevent abuse/timeouts.",
+        "scope_lock_applied": {
+            "fs_div_lock": FS_DIV_LOCK,
+            "sj_div_allowlist": sorted(list(allowlist)),
+        },
         "stock_code": stock_code,
         "corp_code": corp_code,
         "bsns_year": bsns_year,
@@ -283,6 +321,10 @@ async def dart(
     bsns_year: Optional[str] = None,
     reprt_code: Optional[str] = None,
     fs_div: str = "CFS",
+    sj_div_in: Optional[str] = Query(
+        default=None,
+        description="Comma-separated sj_div filter. ex) BS,IS,CIS,SCE,CF (default = all 5)",
+    ),
     cursor: int = 0,
     limit: int = 200,
     authorization: Optional[str] = Header(default=None),
@@ -297,8 +339,8 @@ async def dart(
     if not (stock_code.isdigit() and len(stock_code) == 6):
         raise HTTPException(status_code=400, detail="stock_code must be 6 digits")
 
-    fs_div = fs_div.strip().upper()
-    if fs_div not in ("CFS", "OFS"):
+    fs_div = (fs_div or "").strip().upper()
+    if fs_div and fs_div not in ("CFS", "OFS"):
         raise HTTPException(status_code=400, detail="fs_div must be CFS or OFS")
 
     if cursor < 0:
@@ -323,4 +365,8 @@ async def dart(
             detail="reprt_code required for op=fnltt_all (11011/11012/11013/11014)",
         )
 
-    return await _fnltt_all_page(stock_code, bsns_year, reprt_code, fs_div, cursor, limit)
+    # 강제: 연결(CFS)만 허용 (입력값이 뭐든 서버에서 락)
+    if fs_div and fs_div != "CFS":
+        raise HTTPException(status_code=400, detail="fs_div is locked to CFS (consolidated) in this proxy")
+
+    return await _fnltt_all_page(stock_code, bsns_year, reprt_code, FS_DIV_LOCK, cursor, limit, sj_div_in)
