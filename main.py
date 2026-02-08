@@ -4,11 +4,11 @@
 # - op=list      : regular filings list (A) for target selection
 # - op=fnltt_all : fnlttSinglAcntAll paged (cursor/limit) with server-side cache
 #
-# Scope Lock (강제):
+# Scope Lock (강제: 옵션 A = Forced 5 Statements Mode):
 # - op=fnltt_all 은 "III. 재무에 관한 사항" 범위만 데이터 확보 대상으로 인정한다.
-#   - 2. 연결재무제표 5종: BS/IS/CIS/SCE/CF 만 반환(서버 단 필터)
+#   - 2. 연결재무제표 5종: BS/IS/CIS/SCE/CF 만 반환(서버 단 고정 필터)
 #   - fs_div는 CFS(연결)로 고정(오염 방지)
-# - 1. 요약재무정보는 별도 표 크롤링이 아니라, 위 5종에서 파생/집계하는 것으로 정의한다(수집기/분석기 레벨에서 처리).
+# - 클라이언트가 sj_div/sj_div_in로 일부만 요청하는 행위를 원천 차단한다(파라미터 제거).
 #
 # ⚠️ 절대 주의:
 # - OPENDART_API_KEY는 GitHub에 올리지 말고 Render "Environment"에만 넣어라.
@@ -22,7 +22,7 @@ import xml.etree.ElementTree as ET
 from typing import Dict, Any, Optional, List
 
 import httpx
-from fastapi import FastAPI, HTTPException, Header, Query
+from fastapi import FastAPI, HTTPException, Header
 
 
 # ====== ENV ======
@@ -35,7 +35,7 @@ PROXY_BEARER_TOKEN = (os.getenv("PROXY_BEARER_TOKEN") or "").strip()
 
 
 # ====== APP ======
-app = FastAPI(title="DART Proxy (Single Endpoint)", version="1.0.3")
+app = FastAPI(title="DART Proxy (Single Endpoint) — Forced 5 Statements Mode", version="1.1.0")
 
 
 # ====== CONSTANTS ======
@@ -51,8 +51,7 @@ MAX_CURSOR_PAGES_HINT = 12  # client should stop around this many pages per repo
 
 # III. 재무 스코프 락(연결재무제표 5종)
 FS_DIV_LOCK = "CFS"
-SJ_DIV_ALLOWLIST_DEFAULT = {"BS", "IS", "CIS", "SCE", "CF"}
-REQUIRED_SJ_DIV = ["BS", "IS", "CIS", "SCE", "CF"]
+SJ_DIV_FORCE_5 = ["BS", "IS", "CIS", "SCE", "CF"]  # server-enforced
 
 
 # ====== IN-MEMORY CACHES ======
@@ -94,56 +93,6 @@ def _require_token(authorization: Optional[str]) -> None:
         raise HTTPException(status_code=403, detail="Invalid bearer token")
 
 
-def _required_sj_set() -> List[str]:
-    return REQUIRED_SJ_DIV
-
-
-def _parse_sj_div_in(sj_div_in: Optional[str]) -> List[str]:
-    """
-    sj_div_in: "BS,IS,CIS,SCE,CF" 같은 콤마 구분 문자열.
-    - 허용값만 필터.
-    - 유효값이 하나도 없으면 기본 allowlist 적용(5종).
-    """
-    if not sj_div_in:
-        return sorted(list(SJ_DIV_ALLOWLIST_DEFAULT))
-
-    parsed = {x.strip().upper() for x in sj_div_in.split(",") if x.strip()}
-    allow = parsed.intersection(SJ_DIV_ALLOWLIST_DEFAULT)
-    if not allow:
-        allow = SJ_DIV_ALLOWLIST_DEFAULT
-    return sorted(list(allow))
-
-
-def _parse_sj_div_requested(sj_div: Optional[str], sj_div_in: Optional[str]) -> List[str]:
-    """
-    requested: 클라이언트가 요청한 sj_div 목록(원형 보존).
-    - sj_div(단건)가 있으면 그것이 requested.
-    - sj_div_in(콤마)가 있으면 파싱한 목록이 requested.
-    - 둘 다 없으면 REQUIRED(5종)가 requested.
-    """
-    if sj_div:
-        return [sj_div.strip().upper()]
-    if sj_div_in:
-        parsed = [x.strip().upper() for x in sj_div_in.split(",") if x.strip()]
-        return parsed if parsed else _required_sj_set()
-    return _required_sj_set()
-
-
-def _effective_sj_div(requested: List[str]) -> List[str]:
-    """
-    effective: 서버가 실제 적용한 sj_div(요청 ∩ 정책/락).
-    - 요청값이 전부 비허용이면 기본 5종으로 회귀(안전).
-    """
-    allow = set(SJ_DIV_ALLOWLIST_DEFAULT)
-    eff = sorted(list(set([x.upper() for x in requested]).intersection(allow)))
-    return eff if eff else _required_sj_set()
-
-
-def _missing_sj_div(effective: List[str]) -> List[str]:
-    """missing: REQUIRED(5종) 대비 누락 sj_div"""
-    return sorted(list(set(_required_sj_set()) - set([x.upper() for x in effective])))
-
-
 async def _get_bytes(path: str, params: Dict[str, str]) -> bytes:
     url = f"{OPENDART_BASE}{path}"
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
@@ -179,7 +128,6 @@ async def _refresh_corp_map_if_needed() -> None:
     root = ET.fromstring(xml_data)
 
     m: Dict[str, Dict[str, str]] = {}
-    # CORPCODE.xml contains many <list> nodes
     for node in root.findall(".//list"):
         corp_code = (node.findtext("corp_code") or "").strip()
         corp_name = (node.findtext("corp_name") or "").strip()
@@ -208,13 +156,11 @@ async def _resolve_stock_code(stock_code: str) -> Dict[str, Any]:
     if not info:
         raise HTTPException(status_code=404, detail=f"Unknown stock_code: {stock_code}")
 
-    # company.json to get acc_mt etc.
     comp = await _get_json(
         "/api/company.json",
         {"crtfc_key": OPENDART_API_KEY, "corp_code": info["corp_code"]},
     )
 
-    # status/message는 OpenDART 원문 값을 그대로 전달(일관성)
     return {
         "op": "resolve",
         "status": str(comp.get("status")),
@@ -249,7 +195,6 @@ async def _list_regular_filings(stock_code: str, lookback_years: int) -> Dict[st
     }
     data = await _get_json("/api/list.json", params)
 
-    # shrink payload: keep only common fields
     items: List[Dict[str, Any]] = []
     for it in (data.get("list") or []):
         items.append(
@@ -282,8 +227,6 @@ async def _fnltt_all_page(
     reprt_code: str,
     cursor: int,
     limit: int,
-    sj_div: Optional[str],
-    sj_div_in: Optional[str],
 ) -> Dict[str, Any]:
     resolved = await _resolve_stock_code(stock_code)
     corp_code = resolved["corp_code"]
@@ -312,13 +255,8 @@ async def _fnltt_all_page(
 
     rows = cached.get("list") or []
 
-    # ===== requested/effective/missing (감사/재현성) =====
-    requested = _parse_sj_div_requested(sj_div, sj_div_in)
-    effective = _effective_sj_div(requested)
-    missing = _missing_sj_div(effective)
-
-    # ===== III. 재무 스코프 락(연결 5종만) =====
-    allowlist = set([x.upper() for x in effective])
+    # ===== Forced 5 statements (BS/IS/CIS/SCE/CF) =====
+    allowlist = set(SJ_DIV_FORCE_5)
     filtered = [r for r in rows if (str(r.get("sj_div") or "").upper() in allowlist)]
 
     total_rows = len(filtered)
@@ -333,11 +271,12 @@ async def _fnltt_all_page(
         "hint": f"Client should avoid >{MAX_CURSOR_PAGES_HINT} pages per report to prevent abuse/timeouts.",
         "scope_lock_applied": {
             "fs_div_lock": FS_DIV_LOCK,
-            "sj_div_allowlist": sorted(list(allowlist)),
+            "sj_div_allowlist": SJ_DIV_FORCE_5,
         },
-        "sj_div_in_requested": requested,
-        "sj_div_in_effective": effective,
-        "sj_div_missing": missing,
+        # fixed audit fields (always full set)
+        "sj_div_in_requested": SJ_DIV_FORCE_5,
+        "sj_div_in_effective": SJ_DIV_FORCE_5,
+        "sj_div_missing": [],
         "stock_code": stock_code,
         "corp_code": corp_code,
         "bsns_year": bsns_year,
@@ -365,22 +304,12 @@ async def dart(
     bsns_year: Optional[str] = None,
     reprt_code: Optional[str] = None,
     fs_div: str = "CFS",
-    sj_div: Optional[str] = Query(
-        default=None,
-        description="fnltt_all only. Single sj_div shard: BS/IS/CIS/SCE/CF. Mutually exclusive with sj_div_in.",
-    ),
-    sj_div_in: Optional[str] = Query(
-        default=None,
-        description="Comma-separated sj_div filter. ex) BS,IS,CIS,SCE,CF (default = all 5). Mutually exclusive with sj_div.",
-    ),
     cursor: int = 0,
     limit: int = 200,
     authorization: Optional[str] = Header(default=None),
 ):
-    # optional bearer auth
     _require_token(authorization)
 
-    # basic validations
     if op not in ("resolve", "list", "fnltt_all"):
         raise HTTPException(status_code=400, detail="op must be resolve | list | fnltt_all")
 
@@ -396,10 +325,6 @@ async def dart(
 
     if limit < MIN_LIMIT or limit > MAX_LIMIT:
         raise HTTPException(status_code=400, detail=f"limit must be {MIN_LIMIT}..{MAX_LIMIT}")
-
-    # sj_div / sj_div_in are fnltt_all only
-    if op != "fnltt_all" and (sj_div or sj_div_in):
-        raise HTTPException(status_code=400, detail="sj_div/sj_div_in is only allowed when op=fnltt_all")
 
     if op == "resolve":
         return await _resolve_stock_code(stock_code)
@@ -417,17 +342,8 @@ async def dart(
             detail="reprt_code required for op=fnltt_all (11011/11012/11013/11014)",
         )
 
-    # mutual exclusive
-    if sj_div and sj_div_in:
-        raise HTTPException(status_code=400, detail="Provide either sj_div or sj_div_in, not both")
-
-    if sj_div:
-        sj_div = sj_div.strip().upper()
-        if sj_div not in SJ_DIV_ALLOWLIST_DEFAULT:
-            raise HTTPException(status_code=400, detail="sj_div must be one of BS/IS/CIS/SCE/CF")
-
     # 강제: 연결(CFS)만 허용 (입력값이 뭐든 서버에서 락)
     if fs_div and fs_div != "CFS":
         raise HTTPException(status_code=400, detail="fs_div is locked to CFS (consolidated) in this proxy")
 
-    return await _fnltt_all_page(stock_code, bsns_year, reprt_code, cursor, limit, sj_div, sj_div_in)
+    return await _fnltt_all_page(stock_code, bsns_year, reprt_code, cursor, limit)
